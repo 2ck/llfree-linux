@@ -1153,15 +1153,11 @@ static inline void __free_one_page(struct page *page, unsigned long pfn,
 	// migratetype: memory compaction -> disable for now
 	// fpi_flags: buddy alloc specific (free notifications, list opt, kasan poisioning)
 	u64 ret, cpu;
-	struct capture_control *capc = task_capc(zone);
 
 	VM_BUG_ON(zone->llfree == NULL);
 
 	cpu = get_cpu();
-	if (likely(!is_migrate_isolate(migratetype)) &&
-	    !compaction_capture(capc, page, order, migratetype))
-		__mod_zone_freepage_state(zone, 1 << order, migratetype);
-
+	__mod_zone_freepage_state(zone, 1 << order, migratetype);
 	ret = llfree_put(zone->llfree, cpu, page_to_virt(page), order);
 	put_cpu();
 
@@ -1792,28 +1788,21 @@ static void __free_pages_ok(struct page *page, unsigned int order,
 			    fpi_t fpi_flags)
 {
 	__maybe_unused unsigned long flags;
-	int migratetype;
+	int migratetype = MIGRATE_UNMOVABLE;
 	unsigned long pfn = page_to_pfn(page);
 	struct zone *zone = page_zone(page);
 
 	if (!free_pages_prepare(page, order, true, fpi_flags))
 		return;
 
+#ifndef CONFIG_LLFREE
 	migratetype = get_pfnblock_migratetype(page, pfn);
 
 	// TODO: why is this called twice?
-#ifndef CONFIG_LLFREE
 	spin_lock_irqsave(&zone->lock, flags);
 	if (unlikely(has_isolate_pageblock(zone) ||
 		     is_migrate_isolate(migratetype))) {
 		migratetype = get_pfnblock_migratetype(page, pfn);
-	}
-#else
-	if (unlikely(has_isolate_pageblock(zone) ||
-		     is_migrate_isolate(migratetype))) {
-		spin_lock_irqsave(&zone->lock, flags);
-		migratetype = get_pfnblock_migratetype(page, pfn);
-		spin_unlock_irqrestore(&zone->lock, flags);
 	}
 #endif
 	__free_one_page(page, pfn, zone, order, migratetype, fpi_flags);
@@ -3749,14 +3738,51 @@ void free_unref_page(struct page *page, unsigned int order)
 
 void free_unref_page_list(struct list_head *list)
 {
+	u64 cpu;
+	int count = 0;
 	struct page *page, *next;
+	struct zone *prev_zone = NULL;
+
+	cpu = get_cpu();
 
 	list_for_each_entry_safe(page, next, list, lru) {
-		/*
-		 * Free directly to the allocator.
-		 */
-		__free_pages_ok(page, 0, FPI_NONE);
+		struct zone *zone = page_zone(page);
+
+		// Batch stat updates
+		if (prev_zone != zone) {
+			if (prev_zone != NULL && count > 0) {
+				VM_BUG_ON(zone->llfree == NULL);
+				__count_vm_events(PGFREE, count);
+				__mod_zone_freepage_state(prev_zone, count,
+							  MIGRATE_UNMOVABLE);
+				size_counters_bulk_free(count);
+			}
+			count = 0;
+			prev_zone = zone;
+		}
+
+		if (free_pages_prepare(page, 0, true, FPI_NONE)) {
+			u64 ret = llfree_put(zone->llfree, cpu,
+					     page_to_virt(page), 0);
+			if (ret != 0) {
+				pr_err("llfree: err %lld", ret);
+				VM_BUG_ON_PAGE(true, page);
+			}
+
+			/* Notify page reporting subsystem of freed page */
+			page_reporting_notify_free(0);
+
+			count += 1;
+		}
 	}
+
+	if (prev_zone != NULL && count > 0) {
+		__count_vm_events(PGFREE, count);
+		__mod_zone_freepage_state(prev_zone, count, MIGRATE_UNMOVABLE);
+		size_counters_bulk_free(count);
+	}
+
+	put_cpu();
 }
 #endif // CONFIG_LLFREE
 
