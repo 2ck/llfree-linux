@@ -16,10 +16,9 @@ use alloc::boxed::Box;
 use log::{error, warn, Level, Metadata, Record};
 
 use llfree::frame::{Frame, PFNRange, PFN};
-use llfree::lower::Cache;
-use llfree::upper::Init::Volatile;
-use llfree::upper::{Alloc, AllocExt, Array};
 use llfree::Error;
+use llfree::Init::Volatile;
+use llfree::{Alloc, AllocExt, LLFree};
 
 const MOD: &[u8] = b"llfree\0";
 
@@ -32,8 +31,7 @@ extern "C" {
     fn llfree_linux_printk(format: *const u8, module_name: *const u8, args: *const c_void);
 }
 
-type Lower = Cache<32>;
-type Allocator = Array<3, Lower>;
+type Allocator = LLFree;
 
 static NODE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -102,12 +100,7 @@ pub extern "C" fn llfree_get(alloc: *const Allocator, core: u32, order: u32) -> 
 
 /// Frees a previously allocated page. Returns 0 on success or an error code.
 #[no_mangle]
-pub extern "C" fn llfree_put(
-    alloc: *const Allocator,
-    core: u32,
-    addr: *mut u8,
-    order: u32,
-) -> u64 {
+pub extern "C" fn llfree_put(alloc: *const Allocator, core: u32, addr: *mut u8, order: u32) -> u64 {
     if let Some(alloc) = unsafe { alloc.as_ref() } {
         match alloc.put(core as _, PFN::from_ptr(addr.cast()), order as _) {
             Ok(_) => 0,
